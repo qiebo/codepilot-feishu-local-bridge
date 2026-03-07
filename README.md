@@ -1,19 +1,32 @@
-<img src="docs/icon-readme.png" width="32" height="32" alt="CodePilot" style="vertical-align: middle; margin-right: 8px;" /> CodePilot
+<img src="docs/icon-readme.png" width="32" height="32" alt="CodePilot" style="vertical-align: middle; margin-right: 8px;" /> CodePilot Feishu Local Bridge
 ===
 
-**A desktop GUI client for Claude Code** -- chat, code, and manage projects through a polished visual interface instead of the terminal.
+**A deployable fork of CodePilot focused on local Feishu <-> Claude Code runtime bridging** -- chat with Claude Code from Feishu, return files and screenshots, and keep the agent grounded in the local machine context.
 
-[![GitHub release](https://img.shields.io/github/v/release/op7418/CodePilot)](https://github.com/op7418/CodePilot/releases)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](https://github.com/op7418/CodePilot/releases)
+[![Repo](https://img.shields.io/badge/repo-qiebo%2Fcodepilot--feishu--local--bridge-black)](https://github.com/qiebo/codepilot-feishu-local-bridge)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](https://github.com/qiebo/codepilot-feishu-local-bridge)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [中文文档](./README_CN.md) | [日本語](./README_JA.md)
 
-### Join the Community / 加入用户群
+---
 
-<img src="docs/wechat-group-qr.png" width="240" alt="WeChat Group QR Code" />
+## Fork Focus
 
-Scan the QR code to join the WeChat user group for discussions, feedback, and updates.
+- **Feishu bridge runtime** -- designed to keep a local Claude Code runtime reachable from Feishu through CodePilot's bridge system.
+- **Attachment delivery** -- supports returning local images and files back to Feishu conversations.
+- **Prompt hardening for local execution** -- reduces "cloud-only assistant" drift and makes the agent act like a local operator by default.
+- **Operational handover docs** -- includes local deployment and runtime notes for reproducible setup.
+
+---
+
+## Deployment Notes For This Fork
+
+- Local runtime handover: [`docs/handover/feishu-local-runtime.md`](./docs/handover/feishu-local-runtime.md)
+- Bridge architecture: [`docs/handover/bridge-system.md`](./docs/handover/bridge-system.md)
+- Upstream project: [`op7418/CodePilot`](https://github.com/op7418/CodePilot)
+
+This repository is best treated as a practical deployment fork for Feishu-based local agent access, not as the canonical upstream for CodePilot desktop development.
 
 ---
 
@@ -72,8 +85,8 @@ Pre-built releases are available on the [**Releases**](https://github.com/op7418
 
 ```bash
 # Clone the repository
-git clone https://github.com/op7418/CodePilot.git
-cd CodePilot
+git clone https://github.com/qiebo/codepilot-feishu-local-bridge.git
+cd codepilot-feishu-local-bridge
 
 # Install dependencies
 npm install
