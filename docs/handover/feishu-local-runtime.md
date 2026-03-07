@@ -32,6 +32,11 @@ curl -sS http://127.0.0.1:3416/api/bridge
 - Feishu bridge uses DB-backed conversation history instead of Claude native SDK resume.
 - Bridge history is marked as reference-only; Claude is instructed to answer only the current user message.
 - Bridge appends a local-agent operating prompt so Claude treats the session as local-machine access by default.
+- Feishu does not stream partial answer text. Instead it sends sparse progress updates for important stages on longer tasks.
+- Progress updates are delayed and rate-limited by default:
+  - first status after about 8 seconds of runtime
+  - later status messages no more than about every 18 seconds for phase changes
+  - long-running tool reminders roughly every 45 seconds
 - Feishu attachment return path supports image and file markers:
   - `<<FEISHU_IMAGE:/absolute/path/to/file.png>>`
   - `<<FEISHU_FILE:/absolute/path/to/file.pdf>>`

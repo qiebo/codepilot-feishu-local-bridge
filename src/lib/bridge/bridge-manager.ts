@@ -16,6 +16,7 @@ import type { BaseChannelAdapter } from './channel-adapter';
 import './adapters';
 import * as router from './channel-router';
 import * as engine from './conversation-engine';
+import type { ProgressUpdate } from './conversation-engine';
 import * as broker from './permission-broker';
 import { stripArtifactMarkers, type BridgeArtifact } from './artifact-markers';
 import { deliver, deliverRendered } from './delivery-layer';
@@ -47,10 +48,28 @@ interface StreamConfig {
   maxChars: number;
 }
 
+interface SparseStatusConfig {
+  firstDelayMs: number;
+  minIntervalMs: number;
+  longRunningThresholdMs: number;
+  longRunningRepeatMs: number;
+  maxUpdates: number;
+}
+
 /** Default stream config per channel type. */
 const STREAM_DEFAULTS: Record<string, StreamConfig> = {
   telegram: { intervalMs: 700, minDeltaChars: 20, maxChars: 3900 },
   discord: { intervalMs: 1500, minDeltaChars: 40, maxChars: 1900 },
+};
+
+const SPARSE_STATUS_DEFAULTS: Record<string, SparseStatusConfig> = {
+  feishu: {
+    firstDelayMs: 8000,
+    minIntervalMs: 18000,
+    longRunningThresholdMs: 30000,
+    longRunningRepeatMs: 45000,
+    maxUpdates: 5,
+  },
 };
 
 function getStreamConfig(channelType = 'telegram'): StreamConfig {
@@ -60,6 +79,198 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
   const minDeltaChars = parseInt(getSetting(`${prefix}min_delta_chars`) || '', 10) || defaults.minDeltaChars;
   const maxChars = parseInt(getSetting(`${prefix}max_chars`) || '', 10) || defaults.maxChars;
   return { intervalMs, minDeltaChars, maxChars };
+}
+
+function getSparseStatusConfig(channelType = 'feishu'): SparseStatusConfig {
+  const defaults = SPARSE_STATUS_DEFAULTS[channelType] || SPARSE_STATUS_DEFAULTS.feishu;
+  const prefix = `bridge_${channelType}_status_`;
+
+  return {
+    firstDelayMs: parseInt(getSetting(`${prefix}first_delay_ms`) || '', 10) || defaults.firstDelayMs,
+    minIntervalMs: parseInt(getSetting(`${prefix}min_interval_ms`) || '', 10) || defaults.minIntervalMs,
+    longRunningThresholdMs: parseInt(getSetting(`${prefix}long_running_threshold_ms`) || '', 10) || defaults.longRunningThresholdMs,
+    longRunningRepeatMs: parseInt(getSetting(`${prefix}long_running_repeat_ms`) || '', 10) || defaults.longRunningRepeatMs,
+    maxUpdates: parseInt(getSetting(`${prefix}max_updates`) || '', 10) || defaults.maxUpdates,
+  };
+}
+
+function formatElapsedDuration(elapsedSeconds: number): string {
+  const totalSeconds = Math.max(1, Math.round(elapsedSeconds));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}秒`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (seconds === 0) {
+    return `${minutes}分`;
+  }
+  return `${minutes}分${seconds}秒`;
+}
+
+function mapToolNameToPhase(toolName: string): string {
+  const normalized = toolName.toLowerCase();
+
+  if (normalized.includes('websearch') || normalized.includes('webfetch') || normalized.includes('search')) {
+    return '检索资料';
+  }
+  if (normalized.includes('read') || normalized.includes('glob') || normalized.includes('grep') || normalized.includes('ls')) {
+    return '读取和检查文件';
+  }
+  if (normalized.includes('write') || normalized.includes('edit')) {
+    return '修改文件';
+  }
+  if (normalized.includes('bash') || normalized.includes('shell') || normalized.includes('exec')) {
+    return '执行系统操作';
+  }
+  if (normalized.includes('todo')) {
+    return '整理执行计划';
+  }
+  if (normalized.includes('image') || normalized.includes('screenshot')) {
+    return '处理图片或截图';
+  }
+
+  return `调用 ${toolName} 工具`;
+}
+
+function mapNotificationToStatusText(update: Extract<ProgressUpdate, { kind: 'notification' }>): string | null {
+  const title = (update.title || '').toLowerCase();
+  const message = (update.message || '').toLowerCase();
+
+  if (title.includes('session fallback') || message.includes('starting fresh conversation')) {
+    return '任务进展：会话上下文已重置，正在继续执行';
+  }
+
+  return null;
+}
+
+interface SparseStatusReporter {
+  note(update: ProgressUpdate): void;
+  finish(): void;
+}
+
+function createSparseStatusReporter(
+  adapter: BaseChannelAdapter,
+  address: ChannelAddress,
+  sessionId: string,
+): SparseStatusReporter {
+  const config = getSparseStatusConfig(adapter.channelType);
+  const startedAt = Date.now();
+  let finished = false;
+  let sentCount = 0;
+  let lastSentAt = 0;
+  let lastSentText = '';
+  let currentPhase = '分析任务';
+  let lastLongRunningNoticeAtSeconds = 0;
+  let firstTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const sendStatus = (text: string): void => {
+    if (finished || sentCount >= config.maxUpdates) return;
+    if (!text || text === lastSentText) return;
+
+    sentCount += 1;
+    lastSentAt = Date.now();
+    lastSentText = text;
+
+    deliver(adapter, {
+      address,
+      text,
+      parseMode: 'plain',
+    }, { sessionId }).catch((err) => {
+      console.warn('[bridge-manager] Failed to send sparse status update:', err instanceof Error ? err.message : err);
+    });
+  };
+
+  const maybeSendPhaseUpdate = (nextPhase: string, previousPhase?: string): void => {
+    const now = Date.now();
+
+    if (sentCount === 0) {
+      if (now - startedAt < config.firstDelayMs) return;
+    } else if (now - lastSentAt < config.minIntervalMs) {
+      return;
+    }
+
+    const text = previousPhase && previousPhase !== nextPhase
+      ? `任务进展：已完成${previousPhase}，正在${nextPhase}`
+      : `任务进展：正在${nextPhase}`;
+
+    sendStatus(text);
+  };
+
+  firstTimer = setTimeout(() => {
+    firstTimer = null;
+    if (finished || sentCount > 0) return;
+    sendStatus(`任务进展：正在${currentPhase}`);
+  }, config.firstDelayMs);
+
+  return {
+    note(update: ProgressUpdate): void {
+      if (finished) return;
+
+      switch (update.kind) {
+        case 'session_initialized':
+          if (update.model) {
+            // Keep model metadata in the event path for future use, but don't notify by default.
+          }
+          break;
+
+        case 'tool_started': {
+          const nextPhase = mapToolNameToPhase(update.toolName);
+          if (nextPhase === currentPhase) return;
+
+          const previousPhase = currentPhase;
+          currentPhase = nextPhase;
+          lastLongRunningNoticeAtSeconds = 0;
+          maybeSendPhaseUpdate(nextPhase, sentCount > 0 ? previousPhase : undefined);
+          break;
+        }
+
+        case 'tool_progress': {
+          const nextPhase = mapToolNameToPhase(update.toolName);
+          if (nextPhase !== currentPhase) {
+            const previousPhase = currentPhase;
+            currentPhase = nextPhase;
+            lastLongRunningNoticeAtSeconds = 0;
+            maybeSendPhaseUpdate(nextPhase, sentCount > 0 ? previousPhase : undefined);
+          }
+
+          if (update.elapsedSeconds * 1000 < config.longRunningThresholdMs) return;
+          if (sentCount >= config.maxUpdates) return;
+
+          const now = Date.now();
+          const minRepeatSeconds = Math.floor(config.longRunningRepeatMs / 1000);
+          if (sentCount === 0) {
+            if (now - startedAt < config.firstDelayMs) return;
+          } else if (now - lastSentAt < config.longRunningRepeatMs) {
+            return;
+          }
+          if (update.elapsedSeconds < lastLongRunningNoticeAtSeconds + minRepeatSeconds) return;
+
+          lastLongRunningNoticeAtSeconds = update.elapsedSeconds;
+          sendStatus(`任务进展：正在${currentPhase}，已持续约${formatElapsedDuration(update.elapsedSeconds)}`);
+          break;
+        }
+
+        case 'notification': {
+          const text = mapNotificationToStatusText(update);
+          if (!text) return;
+
+          const now = Date.now();
+          if (sentCount > 0 && now - lastSentAt < config.minIntervalMs) return;
+          sendStatus(text);
+          break;
+        }
+      }
+    },
+
+    finish(): void {
+      finished = true;
+      if (firstTimer) {
+        clearTimeout(firstTimer);
+        firstTimer = null;
+      }
+    },
+  };
 }
 
 /** Fire-and-forget: send a preview draft. Only degrades on permanent failure. */
@@ -547,6 +758,9 @@ async function handleMessage(
   }
 
   const streamCfg = previewState ? getStreamConfig(adapter.channelType) : null;
+  const sparseStatusReporter = (!previewState && adapter.channelType === 'feishu')
+    ? createSparseStatusReporter(adapter, msg.address, binding.codepilotSessionId)
+    : null;
 
   // Build the onPartialText callback (or undefined if preview not supported)
   const onPartialText = (previewState && streamCfg) ? (fullText: string) => {
@@ -610,7 +824,7 @@ async function handleMessage(
         binding.codepilotSessionId,
         perm.suggestions,
       );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText);
+    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, sparseStatusReporter?.note);
 
     // Send response text — render via channel-appropriate format
     if (result.responseText) {
@@ -655,6 +869,7 @@ async function handleMessage(
       }
       adapter.endPreview?.(msg.address.chatId, previewState.draftId);
     }
+    sparseStatusReporter?.finish();
 
     state.activeTasks.delete(binding.codepilotSessionId);
     // Notify adapter that message processing ended

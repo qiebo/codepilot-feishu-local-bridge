@@ -94,6 +94,14 @@ export type OnPermissionRequest = (perm: PermissionRequestInfo) => Promise<void>
  */
 export type OnPartialText = (fullText: string) => void;
 
+export type ProgressUpdate =
+  | { kind: 'session_initialized'; model?: string }
+  | { kind: 'tool_started'; toolName: string }
+  | { kind: 'tool_progress'; toolName: string; elapsedSeconds: number }
+  | { kind: 'notification'; title?: string; message?: string };
+
+export type OnProgressUpdate = (update: ProgressUpdate) => void;
+
 export interface ConversationResult {
   responseText: string;
   artifacts: BridgeArtifact[];
@@ -117,6 +125,7 @@ export async function processMessage(
   abortSignal?: AbortSignal,
   files?: FileAttachment[],
   onPartialText?: OnPartialText,
+  onProgressUpdate?: OnProgressUpdate,
 ): Promise<ConversationResult> {
   const sessionId = binding.codepilotSessionId;
 
@@ -247,7 +256,7 @@ export async function processMessage(
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText);
+    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onProgressUpdate);
   } finally {
     clearInterval(renewalInterval);
     releaseSessionLock(sessionId, lockId);
@@ -264,6 +273,7 @@ async function consumeStream(
   sessionId: string,
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
+  onProgressUpdate?: OnProgressUpdate,
 ): Promise<ConversationResult> {
   const reader = stream.getReader();
   const contentBlocks: MessageContentBlock[] = [];
@@ -309,6 +319,14 @@ async function consumeStream(
             }
             try {
               const toolData = JSON.parse(event.data);
+              if (onProgressUpdate && toolData?.name) {
+                try {
+                  onProgressUpdate({
+                    kind: 'tool_started',
+                    toolName: String(toolData.name),
+                  });
+                } catch { /* non-critical */ }
+              }
               contentBlocks.push({
                 type: 'tool_use',
                 id: toolData.id,
@@ -372,6 +390,24 @@ async function consumeStream(
               if (statusData.model) {
                 updateSessionModel(sessionId, statusData.model);
               }
+              if (onProgressUpdate) {
+                if (statusData.notification) {
+                  try {
+                    onProgressUpdate({
+                      kind: 'notification',
+                      title: typeof statusData.title === 'string' ? statusData.title : undefined,
+                      message: typeof statusData.message === 'string' ? statusData.message : undefined,
+                    });
+                  } catch { /* non-critical */ }
+                } else if (statusData.session_id || statusData.model) {
+                  try {
+                    onProgressUpdate({
+                      kind: 'session_initialized',
+                      model: typeof statusData.model === 'string' ? statusData.model : undefined,
+                    });
+                  } catch { /* non-critical */ }
+                }
+              }
             } catch { /* skip */ }
             break;
           }
@@ -404,7 +440,24 @@ async function consumeStream(
             break;
           }
 
-          // tool_output, tool_timeout, mode_changed, done — ignored for bridge
+          case 'tool_output': {
+            if (!onProgressUpdate) break;
+            try {
+              const toolOutputData = JSON.parse(event.data);
+              if (toolOutputData?._progress && toolOutputData.tool_name) {
+                try {
+                  onProgressUpdate({
+                    kind: 'tool_progress',
+                    toolName: String(toolOutputData.tool_name),
+                    elapsedSeconds: Number(toolOutputData.elapsed_time_seconds) || 0,
+                  });
+                } catch { /* non-critical */ }
+              }
+            } catch { /* ignore non-JSON tool output */ }
+            break;
+          }
+
+          // tool_timeout, mode_changed, done — ignored for bridge
         }
       }
     }
