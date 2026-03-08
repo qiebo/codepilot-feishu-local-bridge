@@ -65,6 +65,18 @@ const TOOL_DISCOVERY_SYSTEM_PROMPT = [
   'If an existing tool or plugin can complete the task, prefer using it over rebuilding the same capability from scratch.',
   'For domain-specific tasks such as login, publishing, browser automation, scraping, or data retrieval, check the relevant project tooling first.',
   'When a tool returns a QR code, screenshot, document, or other structured artifact, return that artifact to the user instead of only summarizing it in text.',
+  'When a tool is needed, invoke the real native tool instead of describing or simulating a tool call in text.',
+  'Never output pseudo tool-call markup such as <function_calls>, <invoke>, XML tool tags, JSON tool plans, or placeholder function syntax to the user.',
+  'After tool execution completes, always give the user a short plain-language conclusion or next step.',
+  'For login, verification, and status-check flows, explicitly tell the user whether the operation succeeded, failed, or still needs human action.',
+].join('\n');
+
+const TOOL_RETRY_SYSTEM_PROMPT = [
+  'Your previous draft tried to represent a tool call in text instead of using a native tool call.',
+  'Retry this turn now.',
+  'If a tool is needed, invoke the actual native tool directly.',
+  'Do not emit <function_calls>, <invoke>, XML, JSON tool plans, or any other pseudo tool syntax.',
+  'After the tool finishes, answer the user with the result in plain language.',
 ].join('\n');
 
 function buildOperatingAgentSystemPrompt(workingDirectory?: string): string {
@@ -129,6 +141,10 @@ export interface ConversationResult {
   tokenUsage: TokenUsage | null;
   hasError: boolean;
   errorMessage: string;
+  actualToolUseCount: number;
+  actualToolResultCount: number;
+  lastToolResultSummary: string;
+  usedPseudoToolMarkup: boolean;
   /** Permission request events that were forwarded during streaming */
   permissionRequests: PermissionRequestInfo[];
   /** SDK session ID captured from status/result events, for session resume */
@@ -160,6 +176,10 @@ export async function processMessage(
       tokenUsage: null,
       hasError: true,
       errorMessage: 'Session is busy processing another request',
+      actualToolUseCount: 0,
+      actualToolResultCount: 0,
+      lastToolResultSummary: '',
+      usedPseudoToolMarkup: false,
       permissionRequests: [],
       sdkSessionId: null,
     };
@@ -257,36 +277,55 @@ export async function processMessage(
       .join('\n\n')
       .trim() || undefined;
 
-    const stream = streamClaude({
-      prompt: text,
-      sessionId,
-      sdkSessionId: shouldUseSdkResumeForBinding(binding)
-        ? (binding.sdkSessionId || undefined)
-        : undefined,
-      model: effectiveModel,
-      systemPrompt: effectiveSystemPrompt,
-      workingDirectory: effectiveWorkingDirectory,
-      abortController,
-      permissionMode,
-      provider: resolvedProvider,
-      conversationHistory: historyMsgs,
-      files,
-      onRuntimeStatusChange: (status: string) => {
-        try { setSessionRuntimeStatus(sessionId, status); } catch { /* best effort */ }
-      },
-    });
+    const runStreamTurn = async (systemPrompt: string | undefined): Promise<ConversationResult> => {
+      const stream = streamClaude({
+        prompt: text,
+        sessionId,
+        sdkSessionId: shouldUseSdkResumeForBinding(binding)
+          ? (binding.sdkSessionId || undefined)
+          : undefined,
+        model: effectiveModel,
+        systemPrompt,
+        workingDirectory: effectiveWorkingDirectory,
+        abortController,
+        permissionMode,
+        provider: resolvedProvider,
+        conversationHistory: historyMsgs,
+        files,
+        onRuntimeStatusChange: (status: string) => {
+          try { setSessionRuntimeStatus(sessionId, status); } catch { /* best effort */ }
+        },
+      });
 
-    // Consume the stream server-side (replicate collectStreamResponse pattern).
-    // Permission requests are forwarded immediately via the callback during streaming
-    // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(
-      stream,
-      sessionId,
-      effectiveWorkingDirectory,
-      onPermissionRequest,
-      onPartialText,
-      onProgressUpdate,
-    );
+      // Consume the stream server-side (replicate collectStreamResponse pattern).
+      // Permission requests are forwarded immediately via the callback during streaming
+      // because the stream blocks until permission is resolved — we can't wait until after.
+      return await consumeStream(
+        stream,
+        sessionId,
+        effectiveWorkingDirectory,
+        onPermissionRequest,
+        onPartialText,
+        onProgressUpdate,
+      );
+    };
+
+    let result = await runStreamTurn(effectiveSystemPrompt);
+
+    const shouldRetryPseudoToolTurn = binding.channelType === 'feishu'
+      && !abortController.signal.aborted
+      && !result.hasError
+      && result.usedPseudoToolMarkup
+      && result.actualToolUseCount === 0
+      && result.actualToolResultCount === 0;
+
+    if (shouldRetryPseudoToolTurn) {
+      result = await runStreamTurn(
+        [effectiveSystemPrompt, TOOL_RETRY_SYSTEM_PROMPT].filter(Boolean).join('\n\n'),
+      );
+    }
+
+    return result;
   } finally {
     clearInterval(renewalInterval);
     releaseSessionLock(sessionId, lockId);
@@ -314,6 +353,9 @@ async function consumeStream(
   let tokenUsage: TokenUsage | null = null;
   let hasError = false;
   let errorMessage = '';
+  let actualToolUseCount = 0;
+  let actualToolResultCount = 0;
+  let lastToolResultSummary = '';
   const seenToolResultIds = new Set<string>();
   const toolResultArtifacts = new Map<string, BridgeArtifact[]>();
   const permissionRequests: PermissionRequestInfo[] = [];
@@ -351,6 +393,7 @@ async function consumeStream(
             }
             try {
               const toolData = JSON.parse(event.data);
+              actualToolUseCount += 1;
               if (onProgressUpdate && toolData?.name) {
                 try {
                   onProgressUpdate({
@@ -404,7 +447,11 @@ async function consumeStream(
                 }
               } else {
                 seenToolResultIds.add(resultData.tool_use_id);
+                actualToolResultCount += 1;
                 contentBlocks.push(newBlock);
+              }
+              if (newBlock.content.trim()) {
+                lastToolResultSummary = newBlock.content.trim();
               }
             } catch { /* skip */ }
             break;
@@ -543,11 +590,15 @@ async function consumeStream(
     }
 
     // Extract text-only response for IM delivery
-    const responseText = cleanedBlocks
+    let responseText = cleanedBlocks
       .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
       .map((b) => b.text)
       .join('')
       .trim();
+
+    if (!responseText && lastToolResultSummary) {
+      responseText = summarizeToolResult(lastToolResultSummary);
+    }
 
     return {
       responseText,
@@ -555,6 +606,10 @@ async function consumeStream(
       tokenUsage,
       hasError,
       errorMessage,
+      actualToolUseCount,
+      actualToolResultCount,
+      lastToolResultSummary,
+      usedPseudoToolMarkup: looksLikePseudoToolMarkup(responseText),
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
     };
@@ -593,10 +648,25 @@ async function consumeStream(
       tokenUsage,
       hasError: true,
       errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),
+      actualToolUseCount,
+      actualToolResultCount,
+      lastToolResultSummary,
+      usedPseudoToolMarkup: false,
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
     };
   }
+}
+
+function summarizeToolResult(content: string): string {
+  return content.trim();
+}
+
+function looksLikePseudoToolMarkup(text: string): boolean {
+  if (!text) return false;
+  return /<function_calls>/i.test(text)
+    || /<invoke\s+name=/i.test(text)
+    || /<\/invoke>/i.test(text);
 }
 
 function extractArtifactsFromContentBlocks(

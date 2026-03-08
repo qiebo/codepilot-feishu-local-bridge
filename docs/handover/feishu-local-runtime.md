@@ -40,6 +40,10 @@ curl -sS http://127.0.0.1:3416/api/bridge
 - The bridge now explicitly treats Feishu as the primary remote-assistant surface:
   - Claude is instructed to inspect existing tools, MCP servers, plugins, and project integrations before rebuilding functionality from scratch
   - domain-specific tasks should prefer existing project tooling first
+- The bridge now also hardens tool execution behavior:
+  - Claude is instructed to use native tool calls instead of printing pseudo `<function_calls>` or `<invoke>` markup
+  - if the model still returns pseudo tool-call markup without any real tool event, the bridge retries the turn once with a stricter tool-use prompt
+  - if a real tool completed but Claude did not provide a plain-language conclusion, the bridge falls back to the last useful tool result so Feishu still receives an outcome
 - Runtime MCP loading is now more explicit:
   - user-scoped MCP config is merged from `~/.claude.json` and `~/.claude/settings.json`
   - project-scoped MCP config is merged from `.cursor/mcp.json` and `.vscode/mcp.json` along the active working-directory path
