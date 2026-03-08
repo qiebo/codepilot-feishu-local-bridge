@@ -57,6 +57,8 @@ curl -sS http://127.0.0.1:3416/api/bridge
   - Claude is instructed to send a QR image, login screenshot, or explicit next-step prompt before waiting for manual action
   - Feishu sends an early reminder for these tasks if they have not returned quickly
   - such tasks auto-pause after about 5 minutes instead of hanging silently forever
+  - visible-browser/manual-login handoffs use a shorter timeout of about 2 minutes and explicitly discourage long-running Playwright wait loops
+- Common natural-language stop requests such as `停止这个任务`, `先停止`, or `cancel this task` are treated like `/stop` when a task is currently running.
 - Feishu attachment return path supports image and file markers:
   - `<<FEISHU_IMAGE:/absolute/path/to/file.png>>`
   - `<<FEISHU_FILE:/absolute/path/to/file.pdf>>`

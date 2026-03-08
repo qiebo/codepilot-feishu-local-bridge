@@ -59,6 +59,8 @@ interface SparseStatusConfig {
 interface HumanGateConfig {
   reminderDelayMs: number;
   timeoutMs: number;
+  manualBrowserReminderDelayMs: number;
+  manualBrowserTimeoutMs: number;
 }
 
 /** Default stream config per channel type. */
@@ -81,6 +83,8 @@ const HUMAN_GATE_DEFAULTS: Record<string, HumanGateConfig> = {
   feishu: {
     reminderDelayMs: 12000,
     timeoutMs: 300000,
+    manualBrowserReminderDelayMs: 6000,
+    manualBrowserTimeoutMs: 120000,
   },
 };
 
@@ -106,6 +110,36 @@ const HUMAN_GATE_PATTERNS: RegExp[] = [
   /\botp\b/i,
   /\bcaptcha\b/i,
   /\bsms\b/i,
+];
+
+const MANUAL_BROWSER_PATTERNS: RegExp[] = [
+  /浏览器/,
+  /虚拟桌面/,
+  /桌面/,
+  /我来登录/,
+  /我帮你登录/,
+  /我帮你完成登录/,
+  /我来操作/,
+  /我来处理/,
+  /\bbrowser\b/i,
+  /\bdesktop\b/i,
+  /\bvisible\b/i,
+  /\bx\.com\b/i,
+  /\btwitter\b/i,
+];
+
+const NATURAL_STOP_PATTERNS: RegExp[] = [
+  /停止(?:这个)?任务/,
+  /先停止/,
+  /取消(?:这个)?任务/,
+  /结束(?:这个)?任务/,
+  /别执行了/,
+  /不用继续了/,
+  /先别继续/,
+  /停一下/,
+  /\bstop(?:\s+this)?(?:\s+task)?\b/i,
+  /\bcancel(?:\s+this)?(?:\s+task)?\b/i,
+  /\babort(?:\s+this)?(?:\s+task)?\b/i,
 ];
 
 function getStreamConfig(channelType = 'telegram'): StreamConfig {
@@ -137,6 +171,8 @@ function getHumanGateConfig(channelType = 'feishu'): HumanGateConfig {
   return {
     reminderDelayMs: parseInt(getSetting(`${prefix}reminder_delay_ms`) || '', 10) || defaults.reminderDelayMs,
     timeoutMs: parseInt(getSetting(`${prefix}timeout_ms`) || '', 10) || defaults.timeoutMs,
+    manualBrowserReminderDelayMs: parseInt(getSetting(`${prefix}manual_browser_reminder_delay_ms`) || '', 10) || defaults.manualBrowserReminderDelayMs,
+    manualBrowserTimeoutMs: parseInt(getSetting(`${prefix}manual_browser_timeout_ms`) || '', 10) || defaults.manualBrowserTimeoutMs,
   };
 }
 
@@ -196,6 +232,18 @@ function isHumanGateTask(text: string): boolean {
   return HUMAN_GATE_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+function isManualBrowserAssistTask(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
+  return MANUAL_BROWSER_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function isNaturalStopRequest(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
+  return NATURAL_STOP_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
 interface HumanGateWatchdog {
   finish(): void;
 }
@@ -212,11 +260,14 @@ function createHumanGateWatchdog(
   }
 
   const config = getHumanGateConfig(adapter.channelType);
+  const manualBrowserAssist = isManualBrowserAssistTask(userText);
   let finished = false;
   let reminderTimer: ReturnType<typeof setTimeout> | null = null;
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const timeoutText = formatElapsedDuration(config.timeoutMs / 1000);
+  const reminderDelayMs = manualBrowserAssist ? config.manualBrowserReminderDelayMs : config.reminderDelayMs;
+  const timeoutMs = manualBrowserAssist ? config.manualBrowserTimeoutMs : config.timeoutMs;
+  const timeoutText = formatElapsedDuration(timeoutMs / 1000);
 
   const sendPlain = (text: string): void => {
     deliver(adapter, {
@@ -231,16 +282,25 @@ function createHumanGateWatchdog(
   reminderTimer = setTimeout(() => {
     reminderTimer = null;
     if (finished) return;
+    if (manualBrowserAssist) {
+      sendPlain(`任务提示：这是人工接管浏览器登录任务。我会优先使用现有浏览器或普通可见浏览器给你手动完成登录，不会继续长时间挂着 Playwright 自动化浏览器等待。请完成登录后回复“继续”或“已完成”。如果等待超过约${timeoutText}，任务会自动暂停。`);
+      return;
+    }
     sendPlain(`任务提示：这是登录/扫码/验证码类任务。我会优先回传二维码、登录界面截图或明确操作提示；如需你人工完成，请在完成后回复“继续”或“已完成”。如果等待超过约${timeoutText}，任务会自动暂停。`);
-  }, config.reminderDelayMs);
+  }, reminderDelayMs);
 
   timeoutTimer = setTimeout(() => {
     timeoutTimer = null;
     if (finished) return;
     finished = true;
+    if (manualBrowserAssist) {
+      sendPlain(`任务已暂停：人工接管浏览器登录任务等待超过约${timeoutText}。这类站点通常会拦截自动化浏览器；请先在可见浏览器中完成登录，再回复“继续”或重新发送任务。`);
+      taskAbort.abort();
+      return;
+    }
     sendPlain(`任务已暂停：登录/扫码/验证码类任务等待超过约${timeoutText}，可能卡在扫码、验证码、授权确认或风控页面。请先完成该步骤，再回复“继续”或重新发送任务。`);
     taskAbort.abort();
-  }, config.timeoutMs);
+  }, timeoutMs);
 
   return {
     finish(): void {
@@ -847,6 +907,24 @@ async function handleMessage(
   const hasAttachments = msg.attachments && msg.attachments.length > 0;
   if (!rawText && !hasAttachments) { ack(); return; }
 
+  const binding = router.resolve(msg.address);
+  const state = getState();
+
+  if (!rawText.startsWith('/') && isNaturalStopRequest(rawText)) {
+    const taskAbort = state.activeTasks.get(binding.codepilotSessionId);
+    if (taskAbort) {
+      taskAbort.abort();
+      state.activeTasks.delete(binding.codepilotSessionId);
+      await deliver(adapter, {
+        address: msg.address,
+        text: '已停止当前任务。',
+        parseMode: 'plain',
+      });
+      ack();
+      return;
+    }
+  }
+
   // Check for IM commands (before sanitization — commands are validated individually)
   if (rawText.startsWith('/')) {
     await handleCommand(adapter, msg, rawText);
@@ -869,15 +947,11 @@ async function handleMessage(
 
   if (!text && !hasAttachments) { ack(); return; }
 
-  // Regular message — route to conversation engine
-  const binding = router.resolve(msg.address);
-
   // Notify adapter that message processing is starting (e.g., typing indicator)
   adapter.onMessageStart?.(msg.address.chatId);
 
   // Create an AbortController so /stop can cancel this task externally
   const taskAbort = new AbortController();
-  const state = getState();
   state.activeTasks.set(binding.codepilotSessionId, taskAbort);
   const humanGateWatchdog = createHumanGateWatchdog(
     adapter,
