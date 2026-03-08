@@ -460,6 +460,31 @@ async function deliverResponse(
   }, { sessionId });
 }
 
+const EXECUTION_CLOSURE_TEXT = '当前任务已执行完毕。如需继续，请直接发送下一条指令。';
+
+function shouldSendExecutionClosure(
+  adapter: BaseChannelAdapter,
+  result: engine.ConversationResult,
+): boolean {
+  if (adapter.channelType !== 'feishu') return false;
+  if (result.hasError) return false;
+  return result.actualToolUseCount > 0
+    || result.actualToolResultCount > 0
+    || result.artifacts.length > 0;
+}
+
+async function deliverExecutionClosure(
+  adapter: BaseChannelAdapter,
+  address: ChannelAddress,
+  sessionId: string,
+): Promise<void> {
+  await deliver(adapter, {
+    address,
+    text: EXECUTION_CLOSURE_TEXT,
+    parseMode: 'plain',
+  }, { sessionId });
+}
+
 function resolveArtifactPath(artifactPath: string, workingDirectory: string): string {
   if (path.isAbsolute(artifactPath)) return artifactPath;
   const baseDir = workingDirectory || process.env.HOME || process.cwd();
@@ -958,6 +983,14 @@ async function handleMessage(
       binding.workingDirectory,
       binding.codepilotSessionId,
     );
+
+    if (shouldSendExecutionClosure(adapter, result)) {
+      await deliverExecutionClosure(
+        adapter,
+        msg.address,
+        binding.codepilotSessionId,
+      );
+    }
 
     if (!result.responseText && result.artifacts.length === 0 && result.hasError) {
       const errorResponse: OutboundMessage = {
