@@ -15,7 +15,7 @@
 - Channel: Feishu
 - Default work dir: `/home/peanut/workspace`
 - Default provider: `env`
-- Default model: `kimi-k2.5`
+- Default model: `doubao-seed-2.0-code`
 - Permissions: `dangerously_skip_permissions=true`
 
 ## Service Commands
@@ -42,6 +42,9 @@ curl -sS http://127.0.0.1:3416/api/bridge
   - first status after about 8 seconds of runtime
   - later status messages no more than about every 18 seconds for phase changes
   - long-running tool reminders roughly every 45 seconds
+  - process-style messages such as `任务进展：...` and `任务提示：...` are rendered
+    as subtle Feishu note cards so they are visually lighter than final result
+    or pause/completion markers
 - The bridge now explicitly treats Feishu as the primary remote-assistant surface:
   - Claude is instructed to inspect existing tools, MCP servers, plugins, and project integrations before rebuilding functionality from scratch
   - domain-specific tasks should prefer existing project tooling first
