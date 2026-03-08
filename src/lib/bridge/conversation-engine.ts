@@ -46,6 +46,18 @@ const BRIDGE_CONTEXT_SYSTEM_PROMPT = [
   'Do not repeat prior conclusions or prior answers unless they are necessary to answer the current user message.',
 ].join('\n');
 
+const HUMAN_GATE_SYSTEM_PROMPT = [
+  'Some tasks require human interaction, such as login, QR scan, SMS verification, CAPTCHA, two-factor approval, device confirmation, or browser authorization.',
+  'When you detect such a task, do not keep the bridge blocked waiting silently for the human step to finish.',
+  'Before any long wait, prepare an actionable checkpoint and send it to the user immediately.',
+  'Prefer non-blocking ways to expose the checkpoint: fetch a QR image or status through project APIs or tools when available.',
+  'If a direct QR image is not available, open the relevant page, capture a concise screenshot, and return it through the Feishu artifact markers.',
+  'After sending the checkpoint, stop the turn and tell the user exactly what to do next, then wait for the user to reply after finishing the human step.',
+  'Ask the user to reply with a short confirmation such as "继续", "已扫码", "已验证", or "已完成" after the manual step is done.',
+  'Do not launch or keep running a command that waits indefinitely for login success unless it has a clear timeout and you have already informed the user.',
+  'If you suspect the task is blocked on user action, say so plainly instead of staying silent.',
+].join('\n');
+
 function buildOperatingAgentSystemPrompt(workingDirectory?: string): string {
   const lines = [
     'You are the local coding agent running inside Claude Code CLI on the user\'s computer.',
@@ -227,6 +239,7 @@ export async function processMessage(
     if (binding.channelType === 'feishu') {
       systemPromptParts.push(BRIDGE_CONTEXT_SYSTEM_PROMPT);
       systemPromptParts.push(buildOperatingAgentSystemPrompt(effectiveWorkingDirectory));
+      systemPromptParts.push(HUMAN_GATE_SYSTEM_PROMPT);
       systemPromptParts.push(FEISHU_ARTIFACT_SYSTEM_PROMPT);
     }
     const effectiveSystemPrompt = systemPromptParts

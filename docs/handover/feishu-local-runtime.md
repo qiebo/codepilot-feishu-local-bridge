@@ -37,6 +37,10 @@ curl -sS http://127.0.0.1:3416/api/bridge
   - first status after about 8 seconds of runtime
   - later status messages no more than about every 18 seconds for phase changes
   - long-running tool reminders roughly every 45 seconds
+- Login, QR scan, SMS verification, CAPTCHA, and similar human-in-the-loop tasks now use a handoff policy:
+  - Claude is instructed to send a QR image, login screenshot, or explicit next-step prompt before waiting for manual action
+  - Feishu sends an early reminder for these tasks if they have not returned quickly
+  - such tasks auto-pause after about 5 minutes instead of hanging silently forever
 - Feishu attachment return path supports image and file markers:
   - `<<FEISHU_IMAGE:/absolute/path/to/file.png>>`
   - `<<FEISHU_FILE:/absolute/path/to/file.pdf>>`

@@ -56,6 +56,11 @@ interface SparseStatusConfig {
   maxUpdates: number;
 }
 
+interface HumanGateConfig {
+  reminderDelayMs: number;
+  timeoutMs: number;
+}
+
 /** Default stream config per channel type. */
 const STREAM_DEFAULTS: Record<string, StreamConfig> = {
   telegram: { intervalMs: 700, minDeltaChars: 20, maxChars: 3900 },
@@ -71,6 +76,37 @@ const SPARSE_STATUS_DEFAULTS: Record<string, SparseStatusConfig> = {
     maxUpdates: 5,
   },
 };
+
+const HUMAN_GATE_DEFAULTS: Record<string, HumanGateConfig> = {
+  feishu: {
+    reminderDelayMs: 12000,
+    timeoutMs: 300000,
+  },
+};
+
+const HUMAN_GATE_PATTERNS: RegExp[] = [
+  /登录/,
+  /登陆/,
+  /扫码/,
+  /二维码/,
+  /验证码/,
+  /短信验证码/,
+  /授权登录/,
+  /账号绑定/,
+  /二次验证/,
+  /人机验证/,
+  /滑块/,
+  /\blogin\b/i,
+  /\blog in\b/i,
+  /\bsign in\b/i,
+  /\bauth(?:enticate|entication)?\b/i,
+  /\bqr(?:\s*code)?\b/i,
+  /\bscan\b/i,
+  /\b2fa\b/i,
+  /\botp\b/i,
+  /\bcaptcha\b/i,
+  /\bsms\b/i,
+];
 
 function getStreamConfig(channelType = 'telegram'): StreamConfig {
   const defaults = STREAM_DEFAULTS[channelType] || STREAM_DEFAULTS.telegram;
@@ -91,6 +127,16 @@ function getSparseStatusConfig(channelType = 'feishu'): SparseStatusConfig {
     longRunningThresholdMs: parseInt(getSetting(`${prefix}long_running_threshold_ms`) || '', 10) || defaults.longRunningThresholdMs,
     longRunningRepeatMs: parseInt(getSetting(`${prefix}long_running_repeat_ms`) || '', 10) || defaults.longRunningRepeatMs,
     maxUpdates: parseInt(getSetting(`${prefix}max_updates`) || '', 10) || defaults.maxUpdates,
+  };
+}
+
+function getHumanGateConfig(channelType = 'feishu'): HumanGateConfig {
+  const defaults = HUMAN_GATE_DEFAULTS[channelType] || HUMAN_GATE_DEFAULTS.feishu;
+  const prefix = `bridge_${channelType}_human_gate_`;
+
+  return {
+    reminderDelayMs: parseInt(getSetting(`${prefix}reminder_delay_ms`) || '', 10) || defaults.reminderDelayMs,
+    timeoutMs: parseInt(getSetting(`${prefix}timeout_ms`) || '', 10) || defaults.timeoutMs,
   };
 }
 
@@ -142,6 +188,73 @@ function mapNotificationToStatusText(update: Extract<ProgressUpdate, { kind: 'no
   }
 
   return null;
+}
+
+function isHumanGateTask(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
+  return HUMAN_GATE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+interface HumanGateWatchdog {
+  finish(): void;
+}
+
+function createHumanGateWatchdog(
+  adapter: BaseChannelAdapter,
+  address: ChannelAddress,
+  sessionId: string,
+  taskAbort: AbortController,
+  userText: string,
+): HumanGateWatchdog | null {
+  if (adapter.channelType !== 'feishu' || !isHumanGateTask(userText)) {
+    return null;
+  }
+
+  const config = getHumanGateConfig(adapter.channelType);
+  let finished = false;
+  let reminderTimer: ReturnType<typeof setTimeout> | null = null;
+  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const timeoutText = formatElapsedDuration(config.timeoutMs / 1000);
+
+  const sendPlain = (text: string): void => {
+    deliver(adapter, {
+      address,
+      text,
+      parseMode: 'plain',
+    }, { sessionId }).catch((err) => {
+      console.warn('[bridge-manager] Failed to send human-gate message:', err instanceof Error ? err.message : err);
+    });
+  };
+
+  reminderTimer = setTimeout(() => {
+    reminderTimer = null;
+    if (finished) return;
+    sendPlain(`任务提示：这是登录/扫码/验证码类任务。我会优先回传二维码、登录界面截图或明确操作提示；如需你人工完成，请在完成后回复“继续”或“已完成”。如果等待超过约${timeoutText}，任务会自动暂停。`);
+  }, config.reminderDelayMs);
+
+  timeoutTimer = setTimeout(() => {
+    timeoutTimer = null;
+    if (finished) return;
+    finished = true;
+    sendPlain(`任务已暂停：登录/扫码/验证码类任务等待超过约${timeoutText}，可能卡在扫码、验证码、授权确认或风控页面。请先完成该步骤，再回复“继续”或重新发送任务。`);
+    taskAbort.abort();
+  }, config.timeoutMs);
+
+  return {
+    finish(): void {
+      finished = true;
+      if (reminderTimer) {
+        clearTimeout(reminderTimer);
+        reminderTimer = null;
+      }
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+    },
+  };
 }
 
 interface SparseStatusReporter {
@@ -741,6 +854,13 @@ async function handleMessage(
   const taskAbort = new AbortController();
   const state = getState();
   state.activeTasks.set(binding.codepilotSessionId, taskAbort);
+  const humanGateWatchdog = createHumanGateWatchdog(
+    adapter,
+    msg.address,
+    binding.codepilotSessionId,
+    taskAbort,
+    rawText,
+  );
 
   // ── Streaming preview setup ──────────────────────────────────
   let previewState: StreamingPreviewState | null = null;
@@ -870,6 +990,7 @@ async function handleMessage(
       adapter.endPreview?.(msg.address.chatId, previewState.draftId);
     }
     sparseStatusReporter?.finish();
+    humanGateWatchdog?.finish();
 
     state.activeTasks.delete(binding.codepilotSessionId);
     // Notify adapter that message processing ended
