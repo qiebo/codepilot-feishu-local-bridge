@@ -34,6 +34,7 @@ import {
   preprocessFeishuMarkdown,
   hasComplexMarkdown,
   buildCardContent,
+  buildNoteCardContent,
   buildPostContent,
 } from '../markdown/feishu';
 
@@ -47,6 +48,10 @@ const MAX_OUTBOUND_FILE_SIZE = 30 * 1024 * 1024;
 
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
+const SUBTLE_STATUS_PREFIXES = [
+  '任务进展：',
+  '任务提示：',
+];
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -301,6 +306,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
     }
 
+    if (this.shouldSendAsSubtleStatus(text, message.parseMode)) {
+      return this.sendAsSubtleStatusCard(message.address.chatId, text);
+    }
+
     // Rendering strategy (aligned with Openclaw):
     // - Code blocks / tables → interactive card (schema 2.0 markdown)
     // - Other text → post (md tag)
@@ -351,6 +360,34 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     // Fallback to post
+    return this.sendAsPost(chatId, text);
+  }
+
+  /**
+   * Send lightweight status text as a note-style card so it renders visually lighter.
+   * Falls back to normal post rendering if the card is rejected by Feishu.
+   */
+  private async sendAsSubtleStatusCard(chatId: string, text: string): Promise<SendResult> {
+    const cardContent = buildNoteCardContent(text);
+
+    try {
+      const res = await this.restClient!.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: cardContent,
+        },
+      });
+
+      if (res?.data?.message_id) {
+        return { ok: true, messageId: res.data.message_id };
+      }
+      console.warn('[feishu-adapter] Subtle status card send failed:', res?.msg, res?.code);
+    } catch (err) {
+      console.warn('[feishu-adapter] Subtle status card error, falling back to post:', err instanceof Error ? err.message : err);
+    }
+
     return this.sendAsPost(chatId, text);
   }
 
@@ -454,6 +491,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : `Failed to send image: ${path.basename(filePath)}` };
     }
+  }
+
+  private shouldSendAsSubtleStatus(text: string, parseMode?: OutboundMessage['parseMode']): boolean {
+    if (parseMode && parseMode !== 'plain') return false;
+    return SUBTLE_STATUS_PREFIXES.some((prefix) => text.startsWith(prefix));
   }
 
   private async trySendLocalFile(chatId: string, filePath: string): Promise<SendResult> {

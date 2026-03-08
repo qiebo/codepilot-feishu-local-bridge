@@ -54,6 +54,32 @@ export function buildCardContent(text: string): string {
 }
 
 /**
+ * Build a subtle Feishu note-style card.
+ * Used for sparse progress / hint messages so they render lighter than main content.
+ */
+export function buildNoteCardContent(text: string): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: {
+      wide_screen_mode: true,
+    },
+    body: {
+      elements: [
+        {
+          tag: 'note',
+          elements: [
+            {
+              tag: 'plain_text',
+              content: text,
+            },
+          ],
+        },
+      ],
+    },
+  });
+}
+
+/**
  * Build Feishu post message content (msg_type: 'post') with md tag.
  * Used for simple text without code blocks or tables.
  * Aligned with Openclaw's buildFeishuPostMessagePayload().
