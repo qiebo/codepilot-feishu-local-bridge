@@ -33,11 +33,13 @@ curl -sS http://127.0.0.1:3416/api/bridge
 - Bridge history is marked as reference-only; Claude is instructed to answer only the current user message.
 - Bridge appends a local-agent operating prompt so Claude treats the session as local-machine access by default.
 - Feishu does not stream partial answer text. Instead it sends sparse progress updates for important stages on longer tasks.
-- For execution-style tasks, Feishu now always receives an explicit final
-  closing message after the result:
+- For execution-style tasks, Feishu now appends an explicit final closing line
+  to the bottom of the final result message instead of sending a separate
+  reminder:
   - `当前任务已执行完毕。如需继续，请直接发送下一条指令。`
-  - this message is intentionally sent after any returned attachments so the
-    last visible message marks task completion
+  - if attachments are returned, they are sent first and the final text/card
+    result is sent last so the closing line appears at the bottom of the final
+    visible result
 - Progress updates are delayed and rate-limited by default:
   - first status after about 8 seconds of runtime
   - later status messages no more than about every 18 seconds for phase changes

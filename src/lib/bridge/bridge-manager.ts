@@ -533,16 +533,40 @@ function shouldSendExecutionClosure(
     || result.artifacts.length > 0;
 }
 
-async function deliverExecutionClosure(
+function buildExecutionClosureSuffix(
   adapter: BaseChannelAdapter,
-  address: ChannelAddress,
-  sessionId: string,
-): Promise<void> {
-  await deliver(adapter, {
-    address,
-    text: EXECUTION_CLOSURE_TEXT,
-    parseMode: 'plain',
-  }, { sessionId });
+): string {
+  if (adapter.channelType === 'feishu') {
+    return `\n\n${EXECUTION_CLOSURE_TEXT}`;
+  }
+  return `\n\n${EXECUTION_CLOSURE_TEXT}`;
+}
+
+function buildFinalResponseText(
+  adapter: BaseChannelAdapter,
+  responseText: string,
+  artifactCount: number,
+  includeClosure: boolean,
+): string {
+  const trimmed = responseText.trim();
+  const closureSuffix = includeClosure ? buildExecutionClosureSuffix(adapter) : '';
+
+  if (trimmed) {
+    if (!includeClosure || trimmed.includes(EXECUTION_CLOSURE_TEXT)) {
+      return trimmed;
+    }
+    return `${trimmed}${closureSuffix}`;
+  }
+
+  if (!includeClosure) {
+    return '';
+  }
+
+  const artifactSummary = artifactCount > 0
+    ? (artifactCount === 1 ? '相关结果已通过附件发送。' : `相关结果已通过附件发送，共 ${artifactCount} 个附件。`)
+    : '任务已完成。';
+
+  return `${artifactSummary}${closureSuffix}`;
 }
 
 function resolveArtifactPath(artifactPath: string, workingDirectory: string): string {
@@ -1045,28 +1069,38 @@ async function handleMessage(
       );
     }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, sparseStatusReporter?.note);
 
-    // Send response text — render via channel-appropriate format
-    if (result.responseText) {
-      await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId);
-    }
-
-    await deliverArtifacts(
+    const includeExecutionClosure = shouldSendExecutionClosure(adapter, result);
+    const finalResponseText = buildFinalResponseText(
       adapter,
-      msg.address,
-      result.artifacts,
-      binding.workingDirectory,
-      binding.codepilotSessionId,
+      result.responseText,
+      result.artifacts.length,
+      includeExecutionClosure,
     );
 
-    if (shouldSendExecutionClosure(adapter, result)) {
-      await deliverExecutionClosure(
+    if (adapter.channelType === 'feishu' && finalResponseText) {
+      await deliverArtifacts(
         adapter,
         msg.address,
+        result.artifacts,
+        binding.workingDirectory,
+        binding.codepilotSessionId,
+      );
+      await deliverResponse(adapter, msg.address, finalResponseText, binding.codepilotSessionId);
+    } else {
+      if (finalResponseText) {
+        await deliverResponse(adapter, msg.address, finalResponseText, binding.codepilotSessionId);
+      }
+
+      await deliverArtifacts(
+        adapter,
+        msg.address,
+        result.artifacts,
+        binding.workingDirectory,
         binding.codepilotSessionId,
       );
     }
 
-    if (!result.responseText && result.artifacts.length === 0 && result.hasError) {
+    if (!finalResponseText && result.artifacts.length === 0 && result.hasError) {
       const errorResponse: OutboundMessage = {
         address: msg.address,
         text: `<b>Error:</b> ${escapeHtml(result.errorMessage)}`,
