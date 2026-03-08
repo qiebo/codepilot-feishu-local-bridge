@@ -12,6 +12,7 @@ import type { ChannelBinding } from './types';
 import type { SSEEvent, TokenUsage, MessageContentBlock, FileAttachment } from '@/types';
 import { extractArtifactMarkers, type BridgeArtifact } from './artifact-markers';
 import { streamClaude } from '../claude-client';
+import { materializeToolResultArtifacts } from '../tool-result-artifacts';
 import {
   addMessage,
   getMessages,
@@ -56,6 +57,14 @@ const HUMAN_GATE_SYSTEM_PROMPT = [
   'Ask the user to reply with a short confirmation such as "继续", "已扫码", "已验证", or "已完成" after the manual step is done.',
   'Do not launch or keep running a command that waits indefinitely for login success unless it has a clear timeout and you have already informed the user.',
   'If you suspect the task is blocked on user action, say so plainly instead of staying silent.',
+].join('\n');
+
+const TOOL_DISCOVERY_SYSTEM_PROMPT = [
+  'This bridge is primarily used as a remote Feishu assistant.',
+  'Before inventing a new script, workflow, or manual workaround, first inspect the tools, MCP servers, plugins, project commands, and existing local integrations already available in the runtime.',
+  'If an existing tool or plugin can complete the task, prefer using it over rebuilding the same capability from scratch.',
+  'For domain-specific tasks such as login, publishing, browser automation, scraping, or data retrieval, check the relevant project tooling first.',
+  'When a tool returns a QR code, screenshot, document, or other structured artifact, return that artifact to the user instead of only summarizing it in text.',
 ].join('\n');
 
 function buildOperatingAgentSystemPrompt(workingDirectory?: string): string {
@@ -239,6 +248,7 @@ export async function processMessage(
     if (binding.channelType === 'feishu') {
       systemPromptParts.push(BRIDGE_CONTEXT_SYSTEM_PROMPT);
       systemPromptParts.push(buildOperatingAgentSystemPrompt(effectiveWorkingDirectory));
+      systemPromptParts.push(TOOL_DISCOVERY_SYSTEM_PROMPT);
       systemPromptParts.push(HUMAN_GATE_SYSTEM_PROMPT);
       systemPromptParts.push(FEISHU_ARTIFACT_SYSTEM_PROMPT);
     }
@@ -269,7 +279,14 @@ export async function processMessage(
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onProgressUpdate);
+    return await consumeStream(
+      stream,
+      sessionId,
+      effectiveWorkingDirectory,
+      onPermissionRequest,
+      onPartialText,
+      onProgressUpdate,
+    );
   } finally {
     clearInterval(renewalInterval);
     releaseSessionLock(sessionId, lockId);
@@ -284,6 +301,7 @@ export async function processMessage(
 async function consumeStream(
   stream: ReadableStream<string>,
   sessionId: string,
+  workingDirectory: string | undefined,
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
   onProgressUpdate?: OnProgressUpdate,
@@ -297,6 +315,7 @@ async function consumeStream(
   let hasError = false;
   let errorMessage = '';
   const seenToolResultIds = new Set<string>();
+  const toolResultArtifacts = new Map<string, BridgeArtifact[]>();
   const permissionRequests: PermissionRequestInfo[] = [];
   let capturedSdkSessionId: string | null = null;
 
@@ -353,17 +372,36 @@ async function consumeStream(
           case 'tool_result': {
             try {
               const resultData = JSON.parse(event.data);
+              const materializedArtifacts = materializeToolResultArtifacts(
+                Array.isArray(resultData.artifacts) ? resultData.artifacts : [],
+                sessionId,
+                workingDirectory,
+              );
               const newBlock = {
                 type: 'tool_result' as const,
                 tool_use_id: resultData.tool_use_id,
-                content: resultData.content,
+                content: typeof resultData.content === 'string' ? resultData.content : '',
                 is_error: resultData.is_error || false,
               };
+              if (materializedArtifacts.length > 0) {
+                toolResultArtifacts.set(resultData.tool_use_id, materializedArtifacts);
+              }
               if (seenToolResultIds.has(resultData.tool_use_id)) {
                 const idx = contentBlocks.findIndex(
                   (b) => b.type === 'tool_result' && 'tool_use_id' in b && b.tool_use_id === resultData.tool_use_id
                 );
-                if (idx >= 0) contentBlocks[idx] = newBlock;
+                if (idx >= 0) {
+                  const previousBlock = contentBlocks[idx];
+                  if (
+                    previousBlock.type === 'tool_result'
+                    && previousBlock.content.trim()
+                    && !newBlock.content.trim()
+                    && !newBlock.is_error
+                  ) {
+                    break;
+                  }
+                  contentBlocks[idx] = newBlock;
+                }
               } else {
                 seenToolResultIds.add(resultData.tool_use_id);
                 contentBlocks.push(newBlock);
@@ -480,7 +518,11 @@ async function consumeStream(
       contentBlocks.push({ type: 'text', text: currentText });
     }
 
-    const { cleanedBlocks, artifacts } = extractArtifactsFromContentBlocks(contentBlocks);
+    const { cleanedBlocks, artifacts: inlineArtifacts } = extractArtifactsFromContentBlocks(contentBlocks);
+    const artifacts = mergeArtifacts(
+      inlineArtifacts,
+      Array.from(toolResultArtifacts.values()).flat(),
+    );
 
     // Save assistant message
     if (cleanedBlocks.length > 0) {
@@ -521,7 +563,11 @@ async function consumeStream(
     if (currentText.trim()) {
       contentBlocks.push({ type: 'text', text: currentText });
     }
-    const { cleanedBlocks, artifacts } = extractArtifactsFromContentBlocks(contentBlocks);
+    const { cleanedBlocks, artifacts: inlineArtifacts } = extractArtifactsFromContentBlocks(contentBlocks);
+    const artifacts = mergeArtifacts(
+      inlineArtifacts,
+      Array.from(toolResultArtifacts.values()).flat(),
+    );
     if (cleanedBlocks.length > 0) {
       const hasToolBlocks = cleanedBlocks.some(
         (b) => b.type === 'tool_use' || b.type === 'tool_result'
@@ -586,6 +632,22 @@ function extractArtifactsFromContentBlocks(
   }
 
   return { cleanedBlocks, artifacts };
+}
+
+function mergeArtifacts(...artifactLists: BridgeArtifact[][]): BridgeArtifact[] {
+  const merged: BridgeArtifact[] = [];
+  const seen = new Set<string>();
+
+  for (const artifactList of artifactLists) {
+    for (const artifact of artifactList) {
+      const key = `${artifact.type}:${artifact.path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(artifact);
+    }
+  }
+
+  return merged;
 }
 
 function summarizeArtifacts(artifacts: BridgeArtifact[]): string {

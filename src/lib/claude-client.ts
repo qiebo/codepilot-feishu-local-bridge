@@ -20,7 +20,9 @@ import { isImageFile } from '@/types';
 import { registerPendingPermission } from './permission-registry';
 import { registerConversation, unregisterConversation } from './conversation-registry';
 import { getSetting, getActiveProvider, updateSdkSessionId, createPermissionRequest } from './db';
+import { resolveEffectiveMcpServers } from './mcp-config';
 import { findClaudeBinary, findGitBash, getExpandedPath } from './platform';
+import { extractToolResultArtifacts } from './tool-result-artifacts';
 import { notifyPermissionRequest, notifyGeneric } from './telegram-bot';
 import os from 'os';
 import fs from 'fs';
@@ -437,11 +439,11 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
           };
         }
 
-        // MCP servers: only pass explicitly provided config (e.g. from CodePilot UI).
-        // User-level MCP config from ~/.claude.json and ~/.claude/settings.json
-        // is now automatically loaded by the SDK via settingSources: ['user', 'project', 'local'].
-        if (mcpServers && Object.keys(mcpServers).length > 0) {
-          queryOptions.mcpServers = toSdkMcpConfig(mcpServers);
+        const resolvedMcpServers = (mcpServers && Object.keys(mcpServers).length > 0)
+          ? mcpServers
+          : resolveEffectiveMcpServers(workingDirectory);
+        if (Object.keys(resolvedMcpServers).length > 0) {
+          queryOptions.mcpServers = toSdkMcpConfig(resolvedMcpServers);
         }
 
         // Resume session if we have an SDK session ID from a previous conversation turn.
@@ -787,20 +789,14 @@ export function streamClaude(options: ClaudeStreamOptions): ReadableStream<strin
               if (Array.isArray(content)) {
                 for (const block of content) {
                   if (block.type === 'tool_result') {
-                    const resultContent = typeof block.content === 'string'
-                      ? block.content
-                      : Array.isArray(block.content)
-                        ? block.content
-                            .filter((c: { type: string }) => c.type === 'text')
-                            .map((c: { text: string }) => c.text)
-                            .join('\n')
-                        : String(block.content ?? '');
+                    const parsedResult = extractToolResultArtifacts(block.content);
                     controller.enqueue(formatSSE({
                       type: 'tool_result',
                       data: JSON.stringify({
                         tool_use_id: block.tool_use_id,
-                        content: resultContent,
+                        content: parsedResult.summary,
                         is_error: block.is_error || false,
+                        artifacts: parsedResult.artifacts,
                       }),
                     }));
                   }

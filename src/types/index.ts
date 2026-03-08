@@ -408,7 +408,7 @@ export interface PluginInfo {
 }
 
 export interface MCPServerConfig {
-  command: string;
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
   type?: 'stdio' | 'sse' | 'http';

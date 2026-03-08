@@ -37,6 +37,13 @@ curl -sS http://127.0.0.1:3416/api/bridge
   - first status after about 8 seconds of runtime
   - later status messages no more than about every 18 seconds for phase changes
   - long-running tool reminders roughly every 45 seconds
+- The bridge now explicitly treats Feishu as the primary remote-assistant surface:
+  - Claude is instructed to inspect existing tools, MCP servers, plugins, and project integrations before rebuilding functionality from scratch
+  - domain-specific tasks should prefer existing project tooling first
+- Runtime MCP loading is now more explicit:
+  - user-scoped MCP config is merged from `~/.claude.json` and `~/.claude/settings.json`
+  - project-scoped MCP config is merged from `.cursor/mcp.json` and `.vscode/mcp.json` along the active working-directory path
+  - HTTP MCP servers still need their backing service to be running, otherwise Claude can see the tool config but cannot call the tool successfully
 - Login, QR scan, SMS verification, CAPTCHA, and similar human-in-the-loop tasks now use a handoff policy:
   - Claude is instructed to send a QR image, login screenshot, or explicit next-step prompt before waiting for manual action
   - Feishu sends an early reminder for these tasks if they have not returned quickly
@@ -44,6 +51,9 @@ curl -sS http://127.0.0.1:3416/api/bridge
 - Feishu attachment return path supports image and file markers:
   - `<<FEISHU_IMAGE:/absolute/path/to/file.png>>`
   - `<<FEISHU_FILE:/absolute/path/to/file.pdf>>`
+- Tool-result artifacts are also supported:
+  - non-text MCP tool results such as Base64 QR-code images are materialized to local files automatically
+  - those files are then sent back to Feishu through the normal attachment delivery path
 
 ## Workspace CLAUDE.md Template
 
