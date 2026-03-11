@@ -22,7 +22,7 @@ import { stripArtifactMarkers, type BridgeArtifact } from './artifact-markers';
 import { deliver, deliverRendered } from './delivery-layer';
 import { markdownToTelegramChunks } from './markdown/telegram';
 import { markdownToDiscordChunks } from './markdown/discord';
-import { getSetting, insertAuditLog, updateChannelBinding } from '../db';
+import { getSetting, insertAuditLog, setSetting, updateChannelBinding, updateSessionModel } from '../db';
 import { setBridgeModeActive } from '../telegram-bot';
 import { escapeHtml } from './adapters/telegram-utils';
 import {
@@ -34,6 +34,28 @@ import {
 } from './security/validators';
 
 const GLOBAL_KEY = '__bridge_manager__';
+
+const BRIDGE_MODEL_ALIASES: Record<string, string> = {
+  code: 'doubao-seed-2.0-code',
+  pro: 'doubao-seed-2.0-pro',
+  kimi: 'kimi-k2.5',
+  'kimi-k2.5': 'kimi-k2.5',
+  'doubao-seed-2.0-code': 'doubao-seed-2.0-code',
+  'doubao-seed-2.0-pro': 'doubao-seed-2.0-pro',
+};
+
+const BRIDGE_MODEL_HELP = [
+  '/model - Show current and available models',
+  '/model code - Switch to doubao-seed-2.0-code',
+  '/model pro - Switch to doubao-seed-2.0-pro',
+  '/model kimi - Switch to kimi-k2.5',
+].join('\n');
+
+function resolveBridgeModelAlias(input: string): string | null {
+  const normalized = input.trim().toLowerCase();
+  if (!normalized) return null;
+  return BRIDGE_MODEL_ALIASES[normalized] || null;
+}
 
 // ── Streaming preview helpers ──────────────────────────────────
 
@@ -1186,6 +1208,7 @@ async function handleCommand(
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
+        '/model code|pro|kimi - Change model',
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
@@ -1252,6 +1275,48 @@ async function handleCommand(
       const binding = router.resolve(msg.address);
       router.updateBinding(binding.id, { mode: args });
       response = `Mode set to <b>${args}</b>`;
+      break;
+    }
+
+    case '/model': {
+      const binding = router.resolve(msg.address);
+      const currentModel = binding.model || getSetting('bridge_default_model') || getSetting('default_model') || 'unset';
+
+      if (!args || ['current', 'list', 'ls'].includes(args.toLowerCase())) {
+        response = [
+          '<b>Bridge Model</b>',
+          '',
+          `Current: <code>${escapeHtml(currentModel)}</code>`,
+          '',
+          '<b>Available:</b>',
+          '<code>code</code> = doubao-seed-2.0-code',
+          '<code>pro</code> = doubao-seed-2.0-pro',
+          '<code>kimi</code> = kimi-k2.5',
+          '',
+          'Usage:',
+          '/model code',
+          '/model pro',
+          '/model kimi',
+        ].join('\n');
+        break;
+      }
+
+      const resolvedModel = resolveBridgeModelAlias(args);
+      if (!resolvedModel) {
+        response = `Unknown model: <code>${escapeHtml(args)}</code>\n\n${BRIDGE_MODEL_HELP}`;
+        break;
+      }
+
+      router.updateBinding(binding.id, { model: resolvedModel });
+      updateSessionModel(binding.codepilotSessionId, resolvedModel);
+      setSetting('bridge_default_model', resolvedModel);
+
+      response = [
+        '<b>Bridge Model Updated</b>',
+        '',
+        `Current session: <code>${escapeHtml(resolvedModel)}</code>`,
+        `New bridge sessions: <code>${escapeHtml(resolvedModel)}</code>`,
+      ].join('\n');
       break;
     }
 
@@ -1324,6 +1389,7 @@ async function handleCommand(
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
+        '/model code|pro|kimi - Change model',
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',

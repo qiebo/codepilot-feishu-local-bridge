@@ -27,6 +27,21 @@ journalctl --user -u codepilot.service -n 100 --no-pager
 curl -sS http://127.0.0.1:3416/api/bridge
 ```
 
+## Bridge Chat Commands
+
+```text
+/status
+/new
+/model
+/model code
+/model pro
+/model kimi
+```
+
+- `/model` shows the current bridge model and supported aliases.
+- `/model code|pro|kimi` updates the current bridge session model and
+  `bridge_default_model`, so later `/new` sessions inherit the same model.
+
 ## Runtime Behavior
 
 - Feishu bridge uses DB-backed conversation history instead of Claude native SDK resume.
